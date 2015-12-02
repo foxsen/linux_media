@@ -19,7 +19,7 @@ static int saa716x_allocate_ptable(struct saa716x_dmabuf *dmabuf)
 	struct pci_dev *pdev		= saa716x->pdev;
 
 	dprintk(SAA716x_DEBUG, 1, "SG Page table allocate");
-	dmabuf->mem_ptab_virt = (void *) __get_free_page(GFP_KERNEL);
+	dmabuf->mem_ptab_virt = (void *) __get_free_page(GFP_KERNEL | GFP_DMA);
 
 	if (dmabuf->mem_ptab_virt == NULL) {
 		dprintk(SAA716x_ERROR, 1, "ERROR: Out of pages !");
@@ -76,7 +76,11 @@ static void saa716x_dmabuf_sgfree(struct saa716x_dmabuf *dmabuf)
 	dmabuf->mem_virt = NULL;
 	if (dmabuf->mem_virt_noalign != NULL) {
 		if (dmabuf->dma_type == SAA716x_DMABUF_INT)
+#ifdef SAA716x_USE_VMALLOC
 			vfree(dmabuf->mem_virt_noalign);
+#else
+			kfree(dmabuf->mem_virt_noalign);
+#endif
 
 		dmabuf->mem_virt_noalign = NULL;
 	}
@@ -119,9 +123,14 @@ static int saa716x_dmabuf_sgalloc(struct saa716x_dmabuf *dmabuf, void *buf, int 
 	sg_init_table(dmabuf->sg_list, pages);
 
 	if (buf == NULL) {
-
 		/* allocate memory, unaligned */
-		dmabuf->mem_virt_noalign = vmalloc((pages + 1) * SAA716x_PAGE_SIZE);
+#ifdef SAA716x_USE_VMALLOC
+		dmabuf->mem_virt_noalign = vmalloc(pages * SAA716x_PAGE_SIZE + PAGE_SIZE);
+#else
+		/* I am not sure whether vmalloced pages will be usable for DMA, so we
+ 		   use kmalloc to ensure this */
+		dmabuf->mem_virt_noalign = kmalloc(pages * SAA716x_PAGE_SIZE + PAGE_SIZE, GFP_DMA);
+#endif
 		if (dmabuf->mem_virt_noalign == NULL) {
 			dprintk(SAA716x_ERROR, 1, "Failed to allocate memory for buffer");
 			return -ENOMEM;
@@ -130,7 +139,6 @@ static int saa716x_dmabuf_sgalloc(struct saa716x_dmabuf *dmabuf, void *buf, int 
 
 		/* align memory to page */
 		dmabuf->mem_virt = (void *) PAGE_ALIGN (((unsigned long) dmabuf->mem_virt_noalign));
-
 		BUG_ON(!((((unsigned long) dmabuf->mem_virt) % SAA716x_PAGE_SIZE) == 0));
 	} else {
 		dmabuf->mem_virt = buf;
@@ -139,15 +147,20 @@ static int saa716x_dmabuf_sgalloc(struct saa716x_dmabuf *dmabuf, void *buf, int 
 	dmabuf->list_len = pages; /* scatterlist length */
 	list = dmabuf->sg_list;
 
+#define N (PAGE_SIZE / SAA716x_PAGE_SIZE)  //assume PAGE_SIZE >= SAA716x_PAGE_SIZE 
 	dprintk(SAA716x_DEBUG, 1, "Allocating SG pages");
 	for (i = 0; i < pages; i++) {
 		if (buf == NULL)
-			pg = vmalloc_to_page(dmabuf->mem_virt + i * SAA716x_PAGE_SIZE);
+#ifdef SAA716x_USE_VMALLOC
+			pg = vmalloc_to_page(dmabuf->mem_virt + (i/N*N) * SAA716x_PAGE_SIZE);
+#else
+			pg = virt_to_page(dmabuf->mem_virt + (i/N*N) * SAA716x_PAGE_SIZE);
+#endif
 		else
 			pg = virt_to_page(dmabuf->mem_virt + i * SAA716x_PAGE_SIZE);
 
 		BUG_ON(pg == NULL);
-		sg_set_page(list, pg, SAA716x_PAGE_SIZE, 0);
+		sg_set_page(list, pg, SAA716x_PAGE_SIZE, (i%N) * SAA716x_PAGE_SIZE);
 		list = sg_next(list);
 	}
 
@@ -163,7 +176,7 @@ static void saa716x_dmabuf_sgpagefill(struct saa716x_dmabuf *dmabuf, struct scat
 	struct scatterlist *sg_cur;
 
 	u32 *page;
-	int i, j, k = 0;
+	int i, j = 0;
 	dma_addr_t addr = 0;
 
 	BUG_ON(dmabuf == NULL);
@@ -182,30 +195,23 @@ static void saa716x_dmabuf_sgpagefill(struct saa716x_dmabuf *dmabuf, struct scat
 
 		if (i == 0)
 			dmabuf->offset = (sg_cur->length + sg_cur->offset) % SAA716x_PAGE_SIZE;
-		else
-			BUG_ON(sg_cur->offset != 0);
 
-		for (j = 0; (j * SAA716x_PAGE_SIZE) < sg_dma_len(sg_cur); j++) {
+		/* I don't understand the logic of the old code. Obviously it does not work when
+ 		   PAGE_SIZE != SAA716x_PAGE_SIZE 
+                */
+		addr = ((u64)sg_dma_address(sg_cur)); 
+		BUG_ON(addr == 0);
+		page[j * 2] = (u32) addr; /* Low */
+		page[j * 2 + 1] = (u32 )(((u64) addr) >> 32); /* High */
+		BUG_ON(page[j * 2] % SAA716x_PAGE_SIZE);
+		j++;
 
-			if ((offset + sg_cur->offset) >= SAA716x_PAGE_SIZE) {
-				offset -= SAA716x_PAGE_SIZE;
-				continue;
-			}
-
-			addr = ((u64)sg_dma_address(sg_cur)) + (j * SAA716x_PAGE_SIZE) - sg_cur->offset;
-
-			BUG_ON(addr == 0);
-			page[k * 2] = (u32) addr; /* Low */
-			page[k * 2 + 1] = (u32 )(((u64) addr) >> 32); /* High */
-			BUG_ON(page[k * 2] % SAA716x_PAGE_SIZE);
-			k++;
-		}
 		sg_cur = sg_next(sg_cur);
 	}
 
-	for (; k < (SAA716x_PAGE_SIZE / 8); k++) {
-		page[k * 2] = (u32 ) addr;
-		page[k * 2 + 1] = (u32 ) (((u64 ) addr) >> 32);
+	for (; j < (SAA716x_PAGE_SIZE / 8); j++) {
+		page[j * 2] = (u32 ) addr;
+		page[j * 2 + 1] = (u32 ) (((u64 ) addr) >> 32);
 	}
 
 	/* make "page table" page writable for the PC */
